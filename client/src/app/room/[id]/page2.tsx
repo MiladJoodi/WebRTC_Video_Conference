@@ -2,9 +2,13 @@
 import { useEffect, useState, memo } from "react";
 import { useParams } from "next/navigation";
 import Peer from "peerjs";
+import io from "socket.io-client";
+import { v4 as uuid4 } from "uuid";
 import { Mic, MicOff, Video, VideoOff } from "lucide-react";
-import { axiosInstanceVC } from "@/lib/axiosInstance";
 
+const socket = io("http://localhost:5000");
+
+// استفاده از React.memo برای بهبود رندر
 const VideoPlayer = memo(({ muted, stream, username }) => {
   useEffect(() => {
     const video = document.getElementById(username) as HTMLVideoElement;
@@ -42,67 +46,113 @@ export default function Room() {
   >([]);
   const [isMicOn, setIsMicOn] = useState(true);
   const [isVideoOn, setIsVideoOn] = useState(true);
-  const [webSocket, setWebSocket] = useState<WebSocket | null>(null);
   const [username, setUsername] = useState(
     localStorage.getItem("username") || "Anonymous"
   );
 
   useEffect(() => {
-    const fetchWebSocketUrl = async () => {
-      try {
-        const response = await axiosInstanceVC.get(`rooms/1/join/`);
-        const data = response.data;
-        const wsUrl = data.ws_url.replace("ws://", "wss://");
+    // مدیریت دقیق اتصالات PeerJS
+    const peer = new Peer(uuid4(), {
+      config: {
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          {
+            urls: "turn:YOUR_TURN_SERVER_URL",
+            username: "YOUR_USERNAME",
+            credential: "YOUR_CREDENTIAL",
+          },
+        ],
+      },
+    });
 
-        const socket = new WebSocket(wsUrl);
-        setWebSocket(socket);
+    setPeerId(peer);
 
-        socket.onopen = () => {
-          console.log("Connected to WebSocket");
-          const joinMessage = JSON.stringify({
-            peer: username,
-            action: "join-room",
-            message: {},
-          });
-          socket.send(joinMessage);
-        };
+    peer.on("open", (id) => {
+      socket.emit("join-room", {
+        roomId: params.id,
+        userId: id,
+        metadata: { name: username },
+      });
+    });
 
-        socket.onmessage = (event) => {
-          const message = JSON.parse(event.data);
-          console.log("WebSocket message received:", message);
+    navigator.mediaDevices
+      .getUserMedia({
+        video: { frameRate: { ideal: 15, max: 30 } },
+        audio: true,
+      })
+      .then((stream: MediaStream) => {
+        setStream(stream);
+      })
+      .catch((err) => {
+        console.error("Error accessing media devices:", err);
+      });
 
-          if (message.action === "user-connected") {
-            console.log("User connected:", message.message);
+    socket.on("user-disconnected", (userId) => {
+      setRemoteStreams((prev) =>
+        prev.filter((item) => item.userId !== userId)
+      );
+    });
+
+    return () => {
+      socket.disconnect();
+      peer.destroy();
+    };
+  }, [params.id, username]);
+
+  useEffect(() => {
+    if (!peerId || !stream) return;
+
+    const handleUserConnected = (user) => {
+      const { userId, metadata } = user;
+      const call = peerId.call(userId, stream, {
+        metadata: { name: username },
+      });
+
+      call.on("stream", (userVideoStream: MediaStream) => {
+        setRemoteStreams((prev) => {
+          const isExist = prev.some((item) => item.userId === userId);
+          if (!isExist) {
+            return [...prev, { userId, stream: userVideoStream, name: metadata.name }];
           }
+          return prev;
+        });
+      });
 
-          if (message.action === "user-disconnected") {
-            const { userId } = message.message;
-            setRemoteStreams((prev) =>
-              prev.filter((item) => item.userId !== userId)
-            );
-          }
-        };
-
-        socket.onclose = () => {
-          console.log("WebSocket connection closed");
-        };
-
-        socket.onerror = (error) => {
-          console.error("WebSocket error:", error);
-        };
-
-        return () => {
-          if (socket.readyState === WebSocket.OPEN) {
-            socket.close();
-          }
-        };
-      } catch (error) {
-        console.error("Error fetching WebSocket URL:", error);
-      }
+      call.on("close", () => {
+        setRemoteStreams((prev) =>
+          prev.filter((item) => item.userId !== userId)
+        );
+      });
     };
 
-    fetchWebSocketUrl();
-  }, [params.id, username]);
+    const handleCall = (call) => {
+      const username = call.metadata?.name;
+      call.answer(stream);
+      call.on("stream", (remoteVideoStream: MediaStream) => {
+        setRemoteStreams((prev) => {
+          const isExist = prev.some((item) => item.userId === call.peer);
+          if (!isExist) {
+            return [...prev, { userId: call.peer, stream: remoteVideoStream, name: username }];
+          }
+          return prev;
+        });
+      });
+
+      call.on("close", () => {
+        setRemoteStreams((prev) =>
+          prev.filter((item) => item.userId !== call.peer)
+        );
+      });
+    };
+
+    socket.on("user-connected", handleUserConnected);
+    peerId.on("call", handleCall);
+
+    return () => {
+      socket.off("user-connected", handleUserConnected);
+      peerId.off("call", handleCall);
+    };
+  }, [peerId, stream, username]);
 
   const toggleVideo = () => {
     if (stream) {

@@ -11,7 +11,7 @@ const page = () => {
 
   const joinRoom = ()=>{
     localStorage.setItem("username", username);
-    router.push(`/room/${uuid()}`);
+    router.push(`/room/1`);
   }
 
   return (
